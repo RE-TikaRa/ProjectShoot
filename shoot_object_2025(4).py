@@ -6,6 +6,7 @@ import math
 import actionlib
 import serial
 import time
+import sys
 from std_msgs.msg import String, Int32
 from actionlib_msgs.msg import *
 from move_base_msgs.msg import MoveBaseAction, MoveBaseGoal
@@ -44,17 +45,156 @@ case3 = 255
 target_id_moving = 255
 target_id_moving_2 = 255
 
+# 线路与Case配置（保留坐标方便后续微调）
+USE_MIDDLE_POINTS_DEFAULT = False  # 默认不走中间点，可在启动时交互选择
+ROUTE_LIBRARY = {
+    'left': {
+        'name': u'左侧路线',
+        'case_labels': [0, 1, 2, 3],
+        'case_meta': {
+            0: {'mode': 'ar_fixed', 'ar_ids': [1], 'log_name': u'左侧固定靶1'},
+            1: {'mode': 'ar_fixed', 'ar_ids': [2], 'log_name': u'左侧固定靶2'},
+            2: {'mode': 'ar_dynamic_1', 'allowed_hint': [3, 4, 5], 'log_name': u'左侧移动靶1'},
+            3: {'mode': 'ar_dynamic_2', 'allowed_hint': [6, 7, 8], 'log_name': u'左侧移动靶2'},
+        },
+        'waypoints': {
+            'without_mid': [
+                {'goal': [1.0, -0.8, 90], 'case': 0, 'label': u'左固定靶1'},
+                {'goal': [1.5, -0.5, 0], 'case': 1, 'label': u'左固定靶2'},
+                {'goal': [2.95, -1.0, 90], 'case': 2, 'label': u'左移动靶1'},
+                {'goal': [2.7, -1.6, 180], 'case': 3, 'label': u'左移动靶2'},
+            ],
+            'with_mid': [
+                {'goal': [0.8, -1.2, 0], 'case': None, 'label': u'左侧中间点A'},
+                {'goal': [1.0, -0.8, 90], 'case': 0, 'label': u'左固定靶1'},
+                {'goal': [1.5, -0.5, 0], 'case': 1, 'label': u'左固定靶2'},
+                {'goal': [2.2, -1.2, 0], 'case': None, 'label': u'左侧中间点B'},
+                {'goal': [2.95, -1.0, 90], 'case': 2, 'label': u'左移动靶1'},
+                {'goal': [2.7, -1.6, 180], 'case': 3, 'label': u'左移动靶2'},
+            ],
+        },
+    },
+    'right': {
+        'name': u'右侧路线',
+        'case_labels': [4, 5, 6, 7],
+        'case_meta': {
+            4: {'mode': 'ar_fixed', 'ar_ids': [1], 'log_name': u'右侧固定靶1'},
+            5: {'mode': 'ar_fixed', 'ar_ids': [2], 'log_name': u'右侧固定靶2'},
+            6: {'mode': 'ar_dynamic_1', 'allowed_hint': [3, 4, 5], 'log_name': u'右侧移动靶1'},
+            7: {'mode': 'ar_dynamic_2', 'allowed_hint': [6, 7, 8], 'log_name': u'右侧移动靶2'},
+        },
+        'waypoints': {
+            'without_mid': [
+                {'goal': [1.0, -2.4, 90], 'case': 4, 'label': u'右固定靶1'},
+                {'goal': [1.5, -2.8, 0], 'case': 5, 'label': u'右固定靶2'},
+                {'goal': [2.95, -2.4, 90], 'case': 6, 'label': u'右移动靶1'},
+                {'goal': [2.7, -1.6, 180], 'case': 7, 'label': u'右移动靶2'},
+            ],
+            'with_mid': [
+                {'goal': [0.8, -2.0, 0], 'case': None, 'label': u'右侧中间点A'},
+                {'goal': [1.0, -2.4, 90], 'case': 4, 'label': u'右固定靶1'},
+                {'goal': [1.5, -2.8, 0], 'case': 5, 'label': u'右固定靶2'},
+                {'goal': [2.2, -2.0, 0], 'case': None, 'label': u'右侧中间点B'},
+                {'goal': [2.95, -2.4, 90], 'case': 6, 'label': u'右移动靶1'},
+                {'goal': [2.7, -1.6, 180], 'case': 7, 'label': u'右移动靶2'},
+            ],
+        },
+    },
+}
+
+
+def _safe_input(prompt):
+    """兼容 Python2/3 的输入函数"""
+    try:
+        return raw_input(prompt)
+    except NameError:
+        return input(prompt)
+
+
+def prompt_start_side():
+    """手动选择起点路线（左=1 / 右=2）"""
+    prompt = u"\n请选择起点（左侧=1 / 右侧=2）："
+    while True:
+        choice = _safe_input(prompt).strip()
+        if choice in ("1", "2"):
+            return 'left' if choice == "1" else 'right'
+        print(u"输入无效，请重新输入 1 或 2。")
+
+
+def prompt_use_middle_points(default_flag=False):
+    """询问是否启用中间点，保留后续灵活性"""
+    default_text = u"y" if default_flag else u"n"
+    prompt = u"是否启用中间点辅助导航？(y/n, 默认%s)：" % default_text
+    while True:
+        choice = _safe_input(prompt).strip().lower()
+        if not choice:
+            return default_flag
+        if choice in ("y", "yes"):
+            return True
+        if choice in ("n", "no"):
+            return False
+        print(u"输入无效，请输入 y 或 n。")
+
+
+def build_route_plan(route_key, use_middle_points):
+    """根据路线和中间点配置构建路径与case映射"""
+    route_cfg = ROUTE_LIBRARY[route_key]
+    waypoint_key = 'with_mid' if use_middle_points else 'without_mid'
+    selected_points = route_cfg['waypoints'][waypoint_key]
+
+    goal_sequence = []
+    case_meta = {}
+    case_order = []
+
+    for idx, point in enumerate(selected_points):
+        entry = {
+            'goal': point['goal'],
+            'label': point.get('label', u'路径点%d' % idx),
+            'case_label': point.get('case')
+        }
+        goal_sequence.append(entry)
+        if point.get('case') is not None:
+            case_label = point['case']
+            meta = dict(route_cfg['case_meta'][case_label])
+            meta['goal_index'] = idx
+            case_meta[case_label] = meta
+            case_order.append(case_label)
+
+    if not case_order:
+        raise ValueError("所选路线没有任何射击case，检查配置是否正确。")
+
+    final_goal_index = len(goal_sequence) - 1
+    return {
+        'route_key': route_key,
+        'route_name': route_cfg['name'],
+        'goal_sequence': goal_sequence,
+        'case_meta': case_meta,
+        'case_order': case_order,
+        'final_goal_index': final_goal_index,
+    }
+
+
+def format_goal(goal_list):
+    """格式化日志中的目标点信息"""
+    return "[{:.2f}, {:.2f}, {:.1f}]".format(goal_list[0], goal_list[1], goal_list[2])
+
 
 class navigation_demo:
-    def __init__(self):
+    def __init__(self, mission_plan):
         global ser
-        self.is_navigating = False  # 导航状态标志，防止导航时瞄准
+        self.mission_plan = mission_plan
+        self.route_name = mission_plan['route_name']
+        self.goal_sequence = mission_plan['goal_sequence']
+        self.case_meta = mission_plan['case_meta']
+        self.case_order = mission_plan['case_order']
+        self.final_goal_index = mission_plan['final_goal_index']
+
+        self.is_navigating = False  # 导航状态标志，防止导航时瞄准冲突
         self.find_cb_executed = False
-        self.ar_cb_executed_case1 = False
-        self.ar_cb_executed_case2 = False
-        self.ar_cb_executed_case3 = False
-        self.ar_cb_executed_case4 = False
-        self.ar_cb_executed_case5 = False
+        self.case_execution_flags = {label: False for label in self.case_order}
+        self.goal_cursor = -1  # goal_sequence 中已完成的索引
+        self.current_case_idx = 0  # case_order 中当前case的位置
+
         self.set_pose_pub = rospy.Publisher('/initialpose', PoseWithCovarianceStamped, queue_size=5)
         self.arrive_pub = rospy.Publisher('/voiceWords', String, queue_size=10)
         self.find_sub = rospy.Subscriber('/object_position', Point, self.find_cb)
@@ -68,7 +208,7 @@ class navigation_demo:
         # 超时机制相关变量
         self.case_start_time = None  # 当前case的开始时间
         self.timeout_threshold = 12  # 超时阈值（秒）
-        self.timeout_check_enabled = False  # 是否启用超时检查
+        self.timeout_check_enabled = False  # 是否启用超时检测
         
         # 目标丢失检测变量
         self.last_target_time = None  # 最后一次接收到目标的时间
@@ -82,6 +222,117 @@ class navigation_demo:
         except Exception as e:
             rospy.logerr("串口初始化失败: %s", str(e))
             ser = None
+
+    def get_case_meta(self, case_label=None):
+        """获取当前case的配置"""
+        label = case_label if case_label is not None else case
+        return self.case_meta.get(label)
+
+    def update_case_index(self, case_label):
+        """根据case标签刷新当前索引"""
+        if case_label in self.case_order:
+            self.current_case_idx = self.case_order.index(case_label)
+
+    def get_next_case_label(self, current_case=None):
+        """取得下一个case标签，没有则返回None"""
+        label = current_case if current_case is not None else case
+        if label not in self.case_order:
+            return None
+        idx = self.case_order.index(label)
+        if idx + 1 < len(self.case_order):
+            return self.case_order[idx + 1]
+        return None
+
+    def move_through_sequence(self, target_index):
+        """按照goal_sequence顺序前往目标索引（含中间点）"""
+        while self.goal_cursor < target_index:
+            self.goal_cursor += 1
+            goal_entry = self.goal_sequence[self.goal_cursor]
+            rospy.loginfo("导航至路径点 #%d %s -> %s",
+                          self.goal_cursor,
+                          goal_entry['label'],
+                          format_goal(goal_entry['goal']))
+            is_final_target = self.goal_cursor == target_index
+            self.goto(goal_entry['goal'])
+            if not is_final_target:
+                # 中间点不计入超时/跟踪，仅作为过渡
+                self.timeout_check_enabled = False
+                self.target_tracking_enabled = False
+
+    def navigate_to_case(self, case_label):
+        """导航到指定case对应的射击点"""
+        meta = self.get_case_meta(case_label)
+        if not meta:
+            rospy.logerr("未找到case=%s的配置，检查路线设置。", str(case_label))
+            return
+        self.move_through_sequence(meta['goal_index'])
+        self.configure_tracking_for_case(case_label)
+        self.update_case_index(case_label)
+        self.find_cb_executed = False
+        rospy.loginfo("已就位 %s（case=%s），等待射击触发。", meta['log_name'], case_label)
+
+    def configure_tracking_for_case(self, case_label):
+        """根据case类型启用/关闭目标丢失监控"""
+        meta = self.get_case_meta(case_label)
+        if not meta:
+            self.target_tracking_enabled = False
+            return
+        if meta.get('mode') == 'vision':
+            self.target_tracking_enabled = True
+            self.last_target_time = time.time()
+        else:
+            self.target_tracking_enabled = False
+
+    def mark_case_completed(self, case_label):
+        """记录case已执行完成"""
+        self.case_execution_flags[case_label] = True
+        rospy.loginfo("case=%s 已完成", str(case_label))
+
+    def resolve_expected_ids(self, stage):
+        """解析当前case所需识别的AR ID列表"""
+        global target_id_moving, target_id_moving_2
+        mode = stage.get('mode')
+        if mode == 'ar_fixed':
+            return stage.get('ar_ids', [])
+        if mode == 'ar_dynamic_1':
+            if target_id_moving == 255:
+                rospy.logwarn("等待手动输入第一个移动靶的AR ID（topic target_id_moving）")
+                return []
+            return [target_id_moving]
+        if mode == 'ar_dynamic_2':
+            if target_id_moving_2 == 255:
+                rospy.logwarn("等待手动输入第二个移动靶的AR ID（topic target_id_moving_2）")
+                return []
+            return [target_id_moving_2]
+        return []
+
+    def proceed_to_next_case(self):
+        """前往下一个case，若没有则执行结束流程"""
+        global case
+        next_case = self.get_next_case_label(case)
+        if next_case is None:
+            rospy.loginfo("全部case已处理，开始执行end()")
+            case = 255
+            self.end()
+            return
+        case = next_case
+        self.navigate_to_case(case)
+
+    def execute_shoot_command(self, stage_name):
+        """向发射控制板发送一轮射击命令"""
+        try:
+            if ser is None or not ser.is_open:
+                rospy.logerr("[%s] 串口未打开，无法射击", stage_name)
+                return False
+            ser.write(b'\x55\x01\x12\x00\x00\x00\x01\x69')
+            rospy.loginfo("[%s] 开火指令已发送", stage_name)
+            rospy.sleep(0.32)
+            ser.write(b'\x55\x01\x11\x00\x00\x00\x01\x68')
+            rospy.loginfo("[%s] 停火指令已发送", stage_name)
+            return True
+        except Exception as e:
+            rospy.logerr("[%s] 射击指令失败: %s", stage_name, str(e))
+            return False
 
     def check_timeout(self):
         """检查当前case是否超时"""
@@ -129,67 +380,44 @@ class navigation_demo:
             self.handle_timeout_skip()
     
     def target_lost_monitor(self, event):
-        """目标丢失监控定时器回调"""
-        global case
-        # 只在固定靶任务时监控（case 0）
-        if case != 0:
+        """固定靶场景下的目标丢失检测"""
+        stage = self.get_case_meta()
+        if not stage or stage.get('mode') != 'vision':
             return
-        
+
         if self.check_target_lost():
-            rospy.logwarn("目标丢失！已 %.2f 秒未检测到目标，停止旋转", 
-                          time.time() - self.last_target_time)
+            rospy.logwarn("%.2f 秒未检测到目标，停止旋转重新等待", time.time() - self.last_target_time)
             self.stop_robot()
-            # 更新时间戳，避免重复打印日志
             self.last_target_time = time.time()
-    
+
     def handle_timeout_skip(self):
-        """处理超时跳转到下一个case"""
+        """超时后跳转到下一个case"""
         global case
-        rospy.logwarn("超时跳过当前任务点，case=%d", case)
-        
-        # 停止机器人运动
-        msg = Twist()
-        self.pub.publish(msg)
-        
-        # 根据当前case跳转到下一个
-        if case == 0:
-            rospy.logwarn("Case 0 超时，跳过第一个固定目标，导航到下一组目标")
-            self.find_cb_executed = True
-            self.goto(goals[1])
-            case = 1
-        elif case == 1:
-            rospy.logwarn("Case 1 超时，跳过移动靶(第一次)，导航到下一个位置")
-            self.ar_cb_executed_case1 = True
-            self.goto(goals[2])
-            case = 2
-        elif case == 2:
-            rospy.logwarn("Case 2 超时，跳过移动靶(第二次)，导航到动态目标位置")
-            self.ar_cb_executed_case2 = True
-            self.goto(goals[3])
-            case = 3
-        elif case == 3:
-            rospy.logwarn("Case 3 超时，跳过动态移动靶1，导航到下一个位置")
-            self.ar_cb_executed_case3 = True
-            self.goto(goals[4])
-            case = 4
-        elif case == 4:
-            rospy.logwarn("Case 4 超时，跳过动态移动靶2，导航到goals[6]")
-            self.ar_cb_executed_case4 = True
-            self.goto(goals[5])  # 中转点
-            self.goto(goals[6])  # 最终位置
-            case = 5
-        elif case == 5:
-            rospy.logwarn("Case 5 超时，跳过target_id_moving_2，直接结束")
-            self.ar_cb_executed_case5 = True
-            case = 6
+        rospy.logwarn("当前case=%s 超时，准备切换下一阶段", str(case))
+
+        # 立即停止底盘运动，避免继续转动
+        self.stop_robot()
+
+        # 标记当前case已结束，防止重复触发
+        if case in self.case_execution_flags:
+            self.case_execution_flags[case] = True
+
+        next_case = self.get_next_case_label(case)
+        if next_case is None:
+            rospy.logwarn("没有更多case，执行收尾流程")
+            case = 255
             self.end()
-        
-        # 重置超时计时器
+            return
+
+        rospy.loginfo("跳转到下一个case=%s", str(next_case))
+        case = next_case
+        self.navigate_to_case(case)
         self.case_start_time = time.time()
-        rospy.loginfo("已跳转到下一个case=%d", case)
-    
+
     def end(self):
-        self.goto(goals[7])
+        """执行收尾动作并保持与旧脚本一致的撤离动作"""
+        if self.final_goal_index is not None:
+            self.move_through_sequence(self.final_goal_index)
 
         global time_var
         time_var = 0  # 重置计数器
@@ -204,242 +432,89 @@ class navigation_demo:
             self.pub.publish(msg)
             rospy.sleep(0.1)
             time_var += 1
-            # 比赛结束语音
-        # os.system('mplayer /home/abot/SU5WNX_ws/src/robot_slam/scripts/end.mp3')
+        # 可在此处补充语音或其他收尾动作
 
     def find_cb(self, data):
-        # 导航期间不进行瞄准，避免与move_base冲突
+        """视觉识别固定靶的回调（预留，当前路线默认使用AR）"""
         if self.is_navigating:
             return
-        
+
         global id, flog0, flog1, flog2, count, move_flog, case
-        
-        # 只在 case=0 时处理固定靶数据，其他case使用AR标记识别
-        if case != 0:
+        stage = self.get_case_meta()
+        if not stage or stage.get('mode') != 'vision':
             return
-        
-        # 更新目标接收时间戳（用于目标丢失检测）
+        if self.case_execution_flags.get(case):
+            return
+
         self.last_target_time = time.time()
-            
         id = 255
         point_msg = data
-        flog0 = point_msg.x - 315 # flog0 = point_msg.x - 320
+        flog0 = point_msg.x - 315
         flog1 = abs(flog0)
 
-        rospy.loginfo("接收到目标位置: x=%f, 偏差=%f, case=%d", point_msg.x, flog0, case)
+        rospy.loginfo("接收到视觉靶位: x=%f, 偏差=%f, case=%s", point_msg.x, flog0, str(case))
 
-        # Case 0 - 第一个固定目标
-        if abs(flog1) > 5 and case == 0:  # 从3放宽到5像素，更容易达到射击条件
+        if abs(flog1) > 5:
             if self.find_cb_executed:
                 return
             msg = Twist()
-            msg.angular.z = -0.013 * flog0 #0.013
+            msg.angular.z = -0.013 * flog0
             self.pub.publish(msg)
-            rospy.loginfo("调整角度: angular.z=%f, 偏差=%f", msg.angular.z, flog1)
-        elif abs(flog1) <= 5 and case == 0:  # 从3放宽到5像素
+            rospy.loginfo("视觉对准中: angular.z=%f, 偏差=%f", msg.angular.z, flog1)
+        else:
             if self.find_cb_executed:
                 return
-            rospy.loginfo("开始射击，目标对准")
-            try:
-                if ser is None or not ser.is_open:
-                    rospy.logerr("串口未打开，无法射击")
-                    return
-                ser.write(b'\x55\x01\x12\x00\x00\x00\x01\x69')
-                rospy.loginfo("射击指令已发送")
-                rospy.sleep(0.2)
-                ser.write(b'\x55\x01\x11\x00\x00\x00\x01\x68')
-                rospy.loginfo("停止射击指令已发送")
+            stage_name = stage.get('log_name', '视觉靶')
+            rospy.loginfo("视觉靶对准成功，准备射击: %s", stage_name)
+            if self.execute_shoot_command(stage_name):
                 self.find_cb_executed = True
-                # 使用线程避免阻塞回调
-                rospy.loginfo("开始导航到下一组目标点")
-                self.goto(goals[1])
-                    # if self.goto(goals[2]):
-                    #     if self.goto(goals[3]):
-                    #         self.goto(goals[4])
+                self.mark_case_completed(case)
                 rospy.sleep(1)
-                case = 1
-            except Exception as e:
-                rospy.logerr("射击失败: %s", str(e))
+                self.proceed_to_next_case()
+            else:
                 self.find_cb_executed = False
 
     def ar_cb(self, data):
-        # 导航期间不进行瞄准，避免与move_base冲突
         if self.is_navigating:
             return
-            
-        global target_id_moving, target_id_moving_2, case
-        ar_markers = data
-        rospy.loginfo("检测到 %d 个AR标记, 当前case=%d", len(data.markers), case)
 
-        for marker in data.markers:
-            rospy.loginfo("AR标记ID: %d, 移动ID1: %d, 移动ID2: %d",
-                          marker.id, target_id_moving, target_id_moving_2)
+        global case
+        stage = self.get_case_meta()
+        if not stage:
+            return
+        mode = stage.get('mode')
+        if mode not in ('ar_fixed', 'ar_dynamic_1', 'ar_dynamic_2'):
+            return
+        if self.case_execution_flags.get(case):
+            return
 
-            if marker.id == 1 and case == 1:
-                if self.ar_cb_executed_case1:
-                    return
-                ar_x_0 = marker.pose.pose.position.x
-                ar_x_0_abs = abs(ar_x_0)
-                rospy.loginfo("移动目标(ID=1) - X偏差: %f (阈值: %f)", ar_x_0_abs, Yaw_th1)
-                if ar_x_0_abs >= Yaw_th1:
-                    msg = Twist()
-                    msg.angular.z = -0.7 * ar_x_0
-                    self.pub.publish(msg)
-                    rospy.loginfo("调整角度对准移动目标: angular.z=%f", msg.angular.z)
-                elif ar_x_0_abs < Yaw_th1:
-                    rospy.loginfo("移动目标(第一次)对准成功，开始射击")
-                    try:
-                        if ser is None or not ser.is_open:
-                            rospy.logerr("串口未打开，无法射击")
-                            return
-                        self.ar_cb_executed_case1 = True
-                        ser.write(b'\x55\x01\x12\x00\x00\x00\x01\x69')
-                        rospy.loginfo("移动目标(第一次)射击指令已发送")
-                        rospy.sleep(0.32)
-                        ser.write(b'\x55\x01\x11\x00\x00\x00\x01\x68')
-                        rospy.sleep(2)
-                        case = 2
-                        rospy.loginfo("切换到case=2, 导航到第二个位置")
-                        self.goto(goals[2])
-                            # self.goto(goals[6])
-                        rospy.sleep(1)
-                    except Exception as e:
-                        rospy.logerr("移动目标(第一次)射击失败: %s", str(e))
-                        self.ar_cb_executed_case1 = False
+        markers = data.markers
+        rospy.loginfo("检测到 %d 个AR靶标，当前case=%s", len(markers), str(case))
+        expected_ids = self.resolve_expected_ids(stage)
+        if not expected_ids:
+            return
 
-            if marker.id == 1 and case == 2:
-                if self.ar_cb_executed_case2:
-                    return
-                ar_x_0 = marker.pose.pose.position.x
-                ar_x_0_abs = abs(ar_x_0)
-                rospy.loginfo("移动目标(ID=1,第二次) - X偏差: %f (阈值: %f)", ar_x_0_abs, Yaw_th1)
-                if ar_x_0_abs >= Yaw_th1:
-                    msg = Twist()
-                    msg.angular.z = -0.7 * ar_x_0
-                    self.pub.publish(msg)
-                    rospy.loginfo("调整角度对准移动目标(第二次): angular.z=%f", msg.angular.z)
-                elif ar_x_0_abs < Yaw_th1:
-                    rospy.loginfo("移动目标(第二次)对准成功，开始射击")
-                    try:
-                        if ser is None or not ser.is_open:
-                            rospy.logerr("串口未打开，无法射击")
-                            return
-                        self.ar_cb_executed_case2 = True
-                        ser.write(b'\x55\x01\x12\x00\x00\x00\x01\x69')
-                        rospy.loginfo("移动目标(第二次)射击指令已发送")
-                        rospy.sleep(0.32)
-                        ser.write(b'\x55\x01\x11\x00\x00\x00\x01\x68')
-                        rospy.sleep(2)
-                        case = 3
-                        rospy.loginfo("切换到case=3, 寻找动态目标")
-                        self.goto(goals[3])
-                        rospy.sleep(1)
-                    except Exception as e:
-                        rospy.logerr("移动目标(第二次)射击失败: %s", str(e))
-                        self.ar_cb_executed_case2 = False
+        for marker in markers:
+            rospy.loginfo("AR靶ID: %d, 期望ID: %s", marker.id, expected_ids)
+            if marker.id not in expected_ids:
+                continue
 
-            if marker.id == target_id_moving and case == 3:
-                if target_id_moving == 255:
-                    rospy.logwarn("target_id_moving未设置，跳过")
-                    return
-                if self.ar_cb_executed_case3:
-                    return
-                ar_x_0 = marker.pose.pose.position.x
-                ar_x_0_abs = abs(ar_x_0)
-                rospy.loginfo("移动目标(动态ID,第一个) - X偏差: %f (阈值: %f)", ar_x_0_abs, Yaw_th1)
-                if ar_x_0_abs >= Yaw_th1:
-                    msg = Twist()
-                    msg.angular.z = -0.7 * ar_x_0  # 0.5
-                    self.pub.publish(msg)
-                    rospy.loginfo("调整角度对准移动目标(动态ID,第一个): angular.z=%f", msg.angular.z)
-                elif ar_x_0_abs < Yaw_th1:
-                    rospy.loginfo("移动目标(动态ID,第一个)对准成功，开始射击")
-                    try:
-                        if ser is None or not ser.is_open:
-                            rospy.logerr("串口未打开，无法射击")
-                            return
-                        self.ar_cb_executed_case3 = True
-                        ser.write(b'\x55\x01\x12\x00\x00\x00\x01\x69')
-                        rospy.loginfo("移动目标(动态ID,第一个)射击指令已发送")
-                        rospy.sleep(0.32)
-                        ser.write(b'\x55\x01\x11\x00\x00\x00\x01\x68')
-                        rospy.sleep(2)
-                        case = 4
-                        rospy.loginfo("切换到case=4, 寻找第二个动态目标")
-                        self.goto(goals[4])
-                        rospy.sleep(1)
-                    except Exception as e:
-                        rospy.logerr("移动目标(动态ID,第一个)射击失败: %s", str(e))
-                        self.ar_cb_executed_case3 = False
-
-            if marker.id == target_id_moving and case == 4:
-                if target_id_moving == 255:
-                    rospy.logwarn("target_id_moving未设置，跳过")
-                    return
-                if self.ar_cb_executed_case4:
-                    return
-                ar_x_0 = marker.pose.pose.position.x
-                ar_x_0_abs = abs(ar_x_0)
-                rospy.loginfo("移动目标(动态ID,第二个位置) - X偏差: %f (阈值: %f)", ar_x_0_abs, Yaw_th1)
-                if ar_x_0_abs >= Yaw_th1:
-                    msg = Twist()
-                    msg.angular.z = -0.7 * ar_x_0
-                    self.pub.publish(msg)
-                    rospy.loginfo("调整角度对准移动目标(动态ID,第二个位置): angular.z=%f", msg.angular.z)
-                elif ar_x_0_abs < Yaw_th1:
-                    rospy.loginfo("移动目标(动态ID,第二个位置)对准成功，开始射击")
-                    try:
-                        if ser is None or not ser.is_open:
-                            rospy.logerr("串口未打开，无法射击")
-                            return
-                        self.ar_cb_executed_case4 = True
-                        ser.write(b'\x55\x01\x12\x00\x00\x00\x01\x69')
-                        rospy.loginfo("移动目标(动态ID,第二个位置)射击指令已发送")
-                        rospy.sleep(0.32)
-                        ser.write(b'\x55\x01\x11\x00\x00\x00\x01\x68')
-                        rospy.sleep(2)
-                        rospy.loginfo("导航到goals[5](中转点)，然后到goals[6]")
-                        self.goto(goals[5])  # 中转点
-                        self.goto(goals[6])  # 最终射击位置
-                        rospy.sleep(1)
-                        case = 5
-                        rospy.loginfo("切换到case=5, 准备射击target_id_moving_2")
-                    except Exception as e:
-                        rospy.logerr("移动目标(动态ID,第二个位置)射击失败: %s", str(e))
-                        self.ar_cb_executed_case4 = False
-
-            if marker.id == target_id_moving_2 and case == 5:
-                if target_id_moving_2 == 255:
-                    rospy.logwarn("target_id_moving_2未设置，跳过")
-                    return
-                if self.ar_cb_executed_case5:
-                    return
-                ar_x_0 = marker.pose.pose.position.x
-                ar_x_0_abs = abs(ar_x_0)
-                rospy.loginfo("移动目标(target_id_moving_2在goals[6]) - X偏差: %f (阈值: %f)", ar_x_0_abs, Yaw_th1)
-                if ar_x_0_abs >= Yaw_th1:
-                    msg = Twist()
-                    msg.angular.z = -0.7 * ar_x_0
-                    self.pub.publish(msg)
-                    rospy.loginfo("调整角度对准移动目标(target_id_moving_2): angular.z=%f", msg.angular.z)
-                elif ar_x_0_abs < Yaw_th1:
-                    rospy.loginfo("移动目标(target_id_moving_2)对准成功，开始射击")
-                    try:
-                        if ser is None or not ser.is_open:
-                            rospy.logerr("串口未打开，无法射击")
-                            return
-                        self.ar_cb_executed_case5 = True
-                        ser.write(b'\x55\x01\x12\x00\x00\x00\x01\x69')
-                        rospy.loginfo("移动目标(target_id_moving_2)射击指令已发送")
-                        rospy.sleep(0.32)
-                        ser.write(b'\x55\x01\x11\x00\x00\x00\x01\x68')
-                        rospy.sleep(2)
-                        rospy.loginfo("所有射击任务完成，导航到终点")
-                        case = 6
-                        self.end()
-                    except Exception as e:
-                        rospy.logerr("移动目标(target_id_moving_2)射击失败: %s", str(e))
-                        self.ar_cb_executed_case5 = False
+            ar_x_0 = marker.pose.pose.position.x
+            ar_x_abs = abs(ar_x_0)
+            if ar_x_abs >= Yaw_th1:
+                msg = Twist()
+                msg.angular.z = -0.7 * ar_x_0
+                self.pub.publish(msg)
+                rospy.loginfo("AR对准中(%s): angular.z=%f", stage['log_name'], msg.angular.z)
+            else:
+                rospy.loginfo("AR对准完成，即将射击: %s", stage['log_name'])
+                if self.execute_shoot_command(stage['log_name']):
+                    self.mark_case_completed(case)
+                    rospy.sleep(2)
+                    self.proceed_to_next_case()
+                else:
+                    rospy.logwarn("射击失败，等待下一次回调")
+            return
 
     def target_id_moving_callback(self, msg):
         global target_id_moving
@@ -539,131 +614,97 @@ class navigation_demo:
             return False
 
     def check_system_status(self):
-        rospy.loginfo("=== 射击系统状态检查 ===")
-        rospy.loginfo("当前case状态: %d", case)
-        rospy.loginfo("目标移动ID1: %d (255=未设置)", target_id_moving)
-        rospy.loginfo("目标移动ID2: %d (255=未设置)", target_id_moving_2)
-        rospy.loginfo("串口端口: %s", serialPort)
-        rospy.loginfo("find_cb_executed标志: %s", self.find_cb_executed)
-        
-        # 检查目标设置状态
+        rospy.loginfo("=== 任务状态自检 ===")
+        rospy.loginfo("当前路线: %s", self.route_name)
+        rospy.loginfo("Case 顺序: %s", self.case_order)
+        rospy.loginfo("当前case标签: %s", str(case))
+        rospy.loginfo("目标移动ID1: %d (255=未配置)", target_id_moving)
+        rospy.loginfo("目标移动ID2: %d (255=未配置)", target_id_moving_2)
+        rospy.loginfo("串口设备: %s", serialPort)
+        rospy.loginfo("视觉回调是否已射击: %s", self.find_cb_executed)
+
         if target_id_moving == 255:
-            rospy.loginfo("等待设置移动靶1目标 AR ID")
+            rospy.loginfo("等待设置第一个移动靶 AR ID")
         else:
-            rospy.loginfo("移动靶1目标已设置: AR ID %d", target_id_moving)
-            
+            rospy.loginfo("第一个移动靶将识别 AR ID %d", target_id_moving)
+
         if target_id_moving_2 == 255:
-            rospy.loginfo("等待设置移动靶2目标 AR ID")
+            rospy.loginfo("等待设置第二个移动靶 AR ID")
         else:
-            rospy.loginfo("移动靶2目标已设置: AR ID %d", target_id_moving_2)
-        
+            rospy.loginfo("第二个移动靶将识别 AR ID %d", target_id_moving_2)
+
         try:
             if ser is None:
-                rospy.logerr("串口未初始化!")
+                rospy.logerr("串口尚未初始化!")
             elif ser.is_open:
-                rospy.loginfo("串口连接正常")
+                rospy.loginfo("串口已打开，可执行射击命令")
             else:
-                rospy.logerr("串口未连接!")
+                rospy.logerr("串口已初始化但未打开!")
         except Exception as e:
-            rospy.logerr("串口检查失败: %s", str(e))
-        
-        rospy.loginfo("=== 系统检查完成 ===")
-        print("请在手动输入终端中设置目标序号...")
+            rospy.logerr("串口状态检查失败: %s", str(e))
+
+        rospy.loginfo("=== 自检结束 ===")
+        print("如需重新输入移动靶ID，请运行 2025_shoot_demo(1).py 手动发布话题。")
+
+
 
 
 if __name__ == "__main__":
+    # 1. 读取用户输入，确定从左/右起点出发以及是否启用中间点
+    route_choice = prompt_start_side()
+    use_middle_points = prompt_use_middle_points(USE_MIDDLE_POINTS_DEFAULT)
+    mission_plan = build_route_plan(route_choice, use_middle_points)
+    goals = [entry['goal'] for entry in mission_plan['goal_sequence']]  # 仅用于调试/查看
+
     rospy.init_node('navigation_demo', anonymous=True)
+    rospy.loginfo("路线选择: %s，是否使用中间点: %s", mission_plan['route_name'], 'YES' if use_middle_points else 'NO')
+    rospy.loginfo("Case 顺序: %s", mission_plan['case_order'])
 
-    # 解析目标点数据
-    goals = [
-        [0.4, -0.4, -90],# [1.13, -0.42, 0],
-        [0.8, -0.2, 0],
-        [1.25, -0.85, -90],
-        [1.8, -1.35, 0],
-        [2.15, -0.5, 90],# [1.05, -1.66, 0],
-        [3.15, -0.4, -90],
-        [3.15, -0.8, -90],
-        [3.15, -0.45, -90],
-]
-
-    
-
-# goals = [
-# [1.13,-0.44,0], # 0
-# [0.07,-0.44,0], # 1
-# [0.07,-1.02,0], # 2
-# [0.07,-1.67,0], # 3
-# [1.03,-1.67,0], # 4
-# [0.05,-1.67,0], # 5 
-# [0.05,-2.24,0], # 6
-# [0.05,-2.88,0], # 7
-# [1.02,-2.88,0], # 8
-# [0.21,-3.02,0]  # 9
-#]
-
-    #x_list = [float(x.strip()) for x in goalListX.split(",")]
-    #y_list = [float(y.strip()) for y in goalListY.split(",")]
-    #yaw_list = [float(yaw.strip()) for yaw in goalListYaw.split(",")]
-    #for x, y, yaw in zip(x_list, y_list, yaw_list):
-        #goals.append([x, y, yaw])
-
-    #rospy.loginfo("解析后的目标点: %s", goals)
-    #rospy.sleep(1)  # 等待节点初始化完成
-
-    # 手动输入系统 - 不再需要音频发布函数
-
-    # 初始化导航实例
-    navi = navigation_demo()
-    
-    # 启动超时监控定时器（每0.5秒检查一次）
+    # 2. 初始化导航控制类并启动监控定时器
+    navi = navigation_demo(mission_plan)
     timeout_monitor_timer = rospy.Timer(rospy.Duration(0.5), navi.timeout_monitor)
-    rospy.loginfo("超时监控定时器已启动，检查周期: 0.5秒")
-    
-    # 启动目标丢失监控定时器（每0.1秒检查一次）
+    rospy.loginfo("超时检测定时器已启动，周期 0.5s")
     target_monitor_timer = rospy.Timer(rospy.Duration(0.1), navi.target_lost_monitor)
-    rospy.loginfo("目标丢失监控定时器已启动，检查周期: 0.1秒")
-    
-    # 系统状态检查
-    navi.check_system_status()
-    # 射击功能测试
-    rospy.loginfo("执行射击测试...")
-    shoot_test_result = navi.test_shoot()
-    if not shoot_test_result:
-        rospy.logerr("射击测试失败，请检查硬件连接!")
+    rospy.loginfo("目标丢失检测定时器已启动，周期 0.1s")
 
-    # 等待启动信号
+    # 3. 上电自检
+    navi.check_system_status()
+    rospy.loginfo("执行射击回路自检...")
+    if not navi.test_shoot():
+        rospy.logerr("射击自检失败，请检查硬件!")
+
+    # 4. 等待 /start 参数被手动输入脚本置为 True
+    rospy.loginfo("等待 /start 参数触发...")
     while not rospy.is_shutdown():
         start_flag = rospy.get_param('/start', False)
         if start_flag:
-            rospy.loginfo("开始比赛")
+            rospy.loginfo("检测到 /start=True，准备继续")
             break
         rospy.sleep(0.5)
 
-    # 手动输入系统 - 等待目标设置完成
-    rospy.loginfo("等待手动输入目标设置...")
+    # 5. 等待手动输入的两个移动靶 AR ID
+    rospy.loginfo("等待手动输入的两个移动靶 AR ID...")
     while not rospy.is_shutdown():
         if target_id_moving != 255 and target_id_moving_2 != 255:
-            rospy.loginfo("目标设置完成 - 移动靶1: AR ID %d, 移动靶2: AR ID %d", 
+            rospy.loginfo("已收到移动靶ID: target_id_moving=%d, target_id_moving_2=%d",
                           target_id_moving, target_id_moving_2)
             break
         rospy.sleep(0.5)
-    
-    rospy.loginfo("开始执行射击任务...")
-    
-    # 导航到第一个目标点
-    navi.goto(goals[0])
+
+    rospy.loginfo("所有前置条件满足，开始执行新地图流程...")
+
+    # 6. 导航至首个射击点，并设置case为对应的标签
+    case = mission_plan['case_order'][0]
+    navi.navigate_to_case(case)
     rospy.sleep(1)
-    case = 0
-    rospy.loginfo("设置初始状态case=0，开始第一阶段")
-    
-    # 启动超时检查机制和目标跟踪检测
+    rospy.loginfo("已进入首个case=%s，开始第一阶段", str(case))
+
+    # 7. 启用超时与目标监控
     navi.case_start_time = time.time()
     navi.timeout_check_enabled = True
     navi.last_target_time = time.time()
-    navi.target_tracking_enabled = True
-    rospy.loginfo("超时检查已启动，超时阈值: %.1f秒", navi.timeout_threshold)
-    rospy.loginfo("目标跟踪检测已启动，目标丢失阈值: %.1f秒", navi.target_lost_threshold)
+    navi.configure_tracking_for_case(case)
+    rospy.loginfo("当前超时阈值: %.1f s", navi.timeout_threshold)
+    rospy.loginfo("目标丢失阈值: %.1f s", navi.target_lost_threshold)
 
-    # 保持节点运行
     rospy.spin()
-
