@@ -1,0 +1,39 @@
+route_name: 右侧路线(含中间点)
+case_order: [4, 5, 6, 7]
+goal_sequence:
+  - label: 右侧中间点A
+    goal: [0.8, -2.0, 0]
+    case_label: null
+  - label: 右固定靶1
+    goal: [1.0, -2.4, 90]
+    case_label: 4
+  - label: 右固定靶2
+    goal: [1.5, -2.8, 0]
+    case_label: 5
+  - label: 右侧中间点B
+    goal: [2.2, -2.0, 0]
+    case_label: null
+  - label: 右移动靶1
+    goal: [2.95, -2.4, 90]
+    case_label: 6
+  - label: 右移动靶2
+    goal: [2.7, -1.6, 180]
+    case_label: 7
+final_goal_index: 5
+case_meta:
+  "4":
+    mode: ar_fixed
+    ar_ids: [1]
+    log_name: 右侧固定靶1
+  "5":
+    mode: ar_fixed
+    ar_ids: [2]
+    log_name: 右侧固定靶2
+  "6":
+    mode: ar_dynamic_1
+    allowed_hint: [3, 4, 5]
+    log_name: 右侧移动靶1
+  "7":
+    mode: ar_dynamic_2
+    allowed_hint: [6, 7, 8]
+    log_name: 右侧移动靶2

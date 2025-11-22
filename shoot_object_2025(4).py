@@ -15,6 +15,7 @@ from geometry_msgs.msg import PoseWithCovarianceStamped, Twist, Point
 from tf_conversions import transformations
 from ar_track_alvar_msgs.msg import AlvarMarkers, AlvarMarker
 import os
+import yaml
 
 # 全局变量定义
 serialPort = "/dev/shoot"
@@ -45,63 +46,15 @@ case3 = 255
 target_id_moving = 255
 target_id_moving_2 = 255
 
-# 线路与Case配置（保留坐标方便后续微调）
-USE_MIDDLE_POINTS_DEFAULT = False  # 默认不走中间点，可在启动时交互选择
-ROUTE_LIBRARY = {
-    'left': {
-        'name': u'左侧路线',
-        'case_labels': [0, 1, 2, 3],
-        'case_meta': {
-            0: {'mode': 'ar_fixed', 'ar_ids': [1], 'log_name': u'左侧固定靶1'},
-            1: {'mode': 'ar_fixed', 'ar_ids': [2], 'log_name': u'左侧固定靶2'},
-            2: {'mode': 'ar_dynamic_1', 'allowed_hint': [3, 4, 5], 'log_name': u'左侧移动靶1'},
-            3: {'mode': 'ar_dynamic_2', 'allowed_hint': [6, 7, 8], 'log_name': u'左侧移动靶2'},
-        },
-        'waypoints': {
-            'without_mid': [
-                {'goal': [1.0, -0.8, 90], 'case': 0, 'label': u'左固定靶1'},
-                {'goal': [1.5, -0.5, 0], 'case': 1, 'label': u'左固定靶2'},
-                {'goal': [2.95, -1.0, 90], 'case': 2, 'label': u'左移动靶1'},
-                {'goal': [2.7, -1.6, 180], 'case': 3, 'label': u'左移动靶2'},
-            ],
-            'with_mid': [
-                {'goal': [0.8, -1.2, 0], 'case': None, 'label': u'左侧中间点A'},
-                {'goal': [1.0, -0.8, 90], 'case': 0, 'label': u'左固定靶1'},
-                {'goal': [1.5, -0.5, 0], 'case': 1, 'label': u'左固定靶2'},
-                {'goal': [2.2, -1.2, 0], 'case': None, 'label': u'左侧中间点B'},
-                {'goal': [2.95, -1.0, 90], 'case': 2, 'label': u'左移动靶1'},
-                {'goal': [2.7, -1.6, 180], 'case': 3, 'label': u'左移动靶2'},
-            ],
-        },
-    },
-    'right': {
-        'name': u'右侧路线',
-        'case_labels': [4, 5, 6, 7],
-        'case_meta': {
-            4: {'mode': 'ar_fixed', 'ar_ids': [1], 'log_name': u'右侧固定靶1'},
-            5: {'mode': 'ar_fixed', 'ar_ids': [2], 'log_name': u'右侧固定靶2'},
-            6: {'mode': 'ar_dynamic_1', 'allowed_hint': [3, 4, 5], 'log_name': u'右侧移动靶1'},
-            7: {'mode': 'ar_dynamic_2', 'allowed_hint': [6, 7, 8], 'log_name': u'右侧移动靶2'},
-        },
-        'waypoints': {
-            'without_mid': [
-                {'goal': [1.0, -2.4, 90], 'case': 4, 'label': u'右固定靶1'},
-                {'goal': [1.5, -2.8, 0], 'case': 5, 'label': u'右固定靶2'},
-                {'goal': [2.95, -2.4, 90], 'case': 6, 'label': u'右移动靶1'},
-                {'goal': [2.7, -1.6, 180], 'case': 7, 'label': u'右移动靶2'},
-            ],
-            'with_mid': [
-                {'goal': [0.8, -2.0, 0], 'case': None, 'label': u'右侧中间点A'},
-                {'goal': [1.0, -2.4, 90], 'case': 4, 'label': u'右固定靶1'},
-                {'goal': [1.5, -2.8, 0], 'case': 5, 'label': u'右固定靶2'},
-                {'goal': [2.2, -2.0, 0], 'case': None, 'label': u'右侧中间点B'},
-                {'goal': [2.95, -2.4, 90], 'case': 6, 'label': u'右移动靶1'},
-                {'goal': [2.7, -1.6, 180], 'case': 7, 'label': u'右移动靶2'},
-            ],
-        },
-    },
+# 线路配置改为 YAML 描述，按交互选项加载
+USE_MIDDLE_POINTS_DEFAULT = False  # 默认不走中间点，可在启动时切换
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+ROUTE_FILE_MAP = {
+    ('left', False): 'route_left_basic.yaml',
+    ('left', True): 'route_left_mid.yaml',
+    ('right', False): 'route_right_basic.yaml',
+    ('right', True): 'route_right_mid.yaml',
 }
-
 
 def _safe_input(prompt):
     """兼容 Python2/3 的输入函数"""
@@ -136,42 +89,76 @@ def prompt_use_middle_points(default_flag=False):
         print(u"输入无效，请输入 y 或 n。")
 
 
-def build_route_plan(route_key, use_middle_points):
-    """根据路线和中间点配置构建路径与case映射"""
-    route_cfg = ROUTE_LIBRARY[route_key]
-    waypoint_key = 'with_mid' if use_middle_points else 'without_mid'
-    selected_points = route_cfg['waypoints'][waypoint_key]
+def load_mission_plan(route_key, use_middle_points):
+    """根据起点与中间点选项，从YAML加载路线计划"""
+    file_name = ROUTE_FILE_MAP.get((route_key, use_middle_points))
+    if not file_name:
+        raise ValueError("无效的路线组合: %s" % str((route_key, use_middle_points)))
+    yaml_path = os.path.join(SCRIPT_DIR, file_name)
+    if not os.path.exists(yaml_path):
+        raise IOError("未找到路线配置文件: %s" % yaml_path)
 
+    with open(yaml_path, 'r') as f:
+        raw = yaml.safe_load(f)
+    return normalize_mission_plan(raw, route_key, use_middle_points, yaml_path)
+
+
+def normalize_mission_plan(raw, route_key, use_middle_points, yaml_path):
+    """整理YAML内容，构造 mission_plan 结构"""
     goal_sequence = []
-    case_meta = {}
-    case_order = []
+    for entry in raw.get('goal_sequence', []):
+        goal = entry.get('goal')
+        if goal is None:
+            raise ValueError("%s 缺少 goal 定义" % yaml_path)
+        case_label = entry.get('case_label')
+        if case_label is not None:
+            try:
+                case_label = int(case_label)
+            except Exception:
+                raise ValueError("%s 中 case_label 无法转换为整数: %s" % (yaml_path, entry))
+        goal_sequence.append({
+            'goal': goal,
+            'label': entry.get('label', u'路径点'),
+            'case_label': case_label,
+        })
 
-    for idx, point in enumerate(selected_points):
-        entry = {
-            'goal': point['goal'],
-            'label': point.get('label', u'路径点%d' % idx),
-            'case_label': point.get('case')
-        }
-        goal_sequence.append(entry)
-        if point.get('case') is not None:
-            case_label = point['case']
-            meta = dict(route_cfg['case_meta'][case_label])
+    if not goal_sequence:
+        raise ValueError("%s 未提供任何路径点" % yaml_path)
+
+    case_order = []
+    for label in raw.get('case_order', []):
+        case_order.append(int(label))
+
+    case_meta = {}
+    for key, meta in raw.get('case_meta', {}).items():
+        case_meta[int(key)] = dict(meta)
+
+    for idx, entry in enumerate(goal_sequence):
+        c_label = entry.get('case_label')
+        if c_label is not None:
+            meta = case_meta.setdefault(c_label, {})
             meta['goal_index'] = idx
-            case_meta[case_label] = meta
-            case_order.append(case_label)
+            if 'log_name' not in meta:
+                meta['log_name'] = u'Case %d' % c_label
 
     if not case_order:
-        raise ValueError("所选路线没有任何射击case，检查配置是否正确。")
+        case_order = sorted(case_meta.keys())
 
-    final_goal_index = len(goal_sequence) - 1
-    return {
+    final_goal_index = raw.get('final_goal_index')
+    if final_goal_index is None:
+        final_goal_index = len(goal_sequence) - 1
+
+    mission_plan = {
         'route_key': route_key,
-        'route_name': route_cfg['name'],
+        'route_name': raw.get('route_name', '%s-route' % route_key),
         'goal_sequence': goal_sequence,
         'case_meta': case_meta,
         'case_order': case_order,
         'final_goal_index': final_goal_index,
+        'yaml_path': yaml_path,
+        'use_middle_points': use_middle_points,
     }
+    return mission_plan
 
 
 def format_goal(goal_list):
@@ -653,7 +640,7 @@ if __name__ == "__main__":
     # 1. 读取用户输入，确定从左/右起点出发以及是否启用中间点
     route_choice = prompt_start_side()
     use_middle_points = prompt_use_middle_points(USE_MIDDLE_POINTS_DEFAULT)
-    mission_plan = build_route_plan(route_choice, use_middle_points)
+    mission_plan = load_mission_plan(route_choice, use_middle_points)
     goals = [entry['goal'] for entry in mission_plan['goal_sequence']]  # 仅用于调试/查看
 
     rospy.init_node('navigation_demo', anonymous=True)
